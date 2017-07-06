@@ -59,6 +59,7 @@ local ngx_ERR = ngx.ERR
 local ngx_DEBUG = ngx.DEBUG
 local ngx_WARN = ngx.WARN
 local log_prefix = "[ringbalancer] "
+local SLOT_REASSIGNED = "cannot get peer, current slot got reassigned"
 
 local _M = {}
 
@@ -100,15 +101,15 @@ end
 local objAddr = {}
 
 -- Returns the peer info.
--- @return ip-address, port and hostname of the target
+-- @return ip-address, port and address object of the target
 function objAddr:getPeer(cacheOnly)
   if self.ipType == "name" then
     -- SRV type record with a named target
     local ip, port = dns.toip(self.ip, self.port, cacheOnly)
-    return ip, port, self.host.name
+    return ip, port, self
   else
     -- just an IP address
-    return self.ip, self.port, self.host.hostname
+    return self.ip, self.port, self
   end
 end
 
@@ -203,6 +204,12 @@ function objAddr:change(newWeight)
   self.weight = newWeight
 end
 
+-- mark the address as up or down.
+-- @param state (boolean) if truthy, the `address` will be marked as UP, otherwise DOWN
+function objAddr:setStatus(state)
+  self.up = not not state -- force to boolean
+end
+
 -- creates a new address object.
 -- @param ip the upstream ip address or target name
 -- @param port the upstream port number
@@ -220,6 +227,7 @@ local newAddress = function(ip, port, weight, host)
     slots = {},           -- the slots assigned to this address
     index = nil,          -- reverse index in the ordered part of the containing balancer
     disabled = false,     -- has this record been disabled? (before deleting)
+    up = true,            -- is the target up
   }
   for name, method in pairs(objAddr) do addr[name] = method end
   
@@ -471,6 +479,7 @@ function objHost:addAddress(entry)
     entry.weight or self.nodeWeight, 
     self
   )
+  self.balancer.addressCount = self.balancer.addressCount + 1
 end
 
 -- Looks up and disables an `address` object from the `host`.
@@ -496,6 +505,7 @@ function objHost:deleteAddresses()
     if self.addresses[i].disabled then
       self.addresses[i]:delete()
       table_remove(self.addresses, i)
+      self.balancer.addressCount = self.balancer.addressCount - 1
     end
   end
 
@@ -530,7 +540,7 @@ end
 -- Gets address and port number from a specific slot owned by the host.
 -- The slot MUST be owned by the host. Call balancer:getPeer, never this one.
 -- access: balancer:getPeer->slot->address->host->returns addr+port
-function objHost:getPeer(hashValue, cacheOnly, slot)
+function objHost:getPeer(slot, cacheOnly)
   
   if (self.lastQuery.expire or 0) < time() and not cacheOnly then
     -- ttl expired, so must renew
@@ -540,7 +550,7 @@ function objHost:getPeer(hashValue, cacheOnly, slot)
       -- our slot has been reallocated to another host, so recurse to start over
       ngx_log(ngx_DEBUG, log_prefix, "slot previously assigned to ", self.hostname,
               " was reassigned to another due to a dns update")
-      return self.balancer:getPeer(hashValue, cacheOnly)
+      return nil, SLOT_REASSIGNED
     end
   end
 
@@ -743,6 +753,22 @@ function objBalancer:addHost(hostname, port, weight)
   return self
 end
 
+--- Gets a host object from a balancer.
+-- @function getHost
+-- @param hostname hostname to look up
+-- @param port port to look up (optional, defaults to 80 if omitted)
+-- @return host object, `nil + err` if not found, or an error on bad input
+function objBalancer:getHost(hostname, port)
+  assert(type(hostname) == "string", "expected a hostname (string), got "..tostring(hostname))
+  port = port or DEFAULT_PORT
+  for i, host in ipairs(self.hosts) do
+    if host.hostname == hostname and host.port == port then
+      return host
+    end
+  end
+  return nil, "No such host: " .. hostname .. ":" .. tostring(port)
+end
+
 --- Removes a host from a balancer. All assigned slots will be redistributed 
 -- to the remaining targets. Only the slots from the removed host will loose
 -- their consistency, all other slots are guaranteed to remain in place.
@@ -798,26 +824,69 @@ end
 -- @param retryCount should be 0 (or `nil`) on the initial try, 1 on the first
 -- retry, etc. If provided, it will be added to the `hashValue` to make it fall-through.
 -- @param cacheOnly If truthy, no dns lookups will be done, only cache.
--- @return `ip + port + hostname`, or `nil+error`
+-- @return `ip + port + addrObject`, or `nil+error`
 function objBalancer:getPeer(hashValue, retryCount, cacheOnly)
-  local pointer
   if self.weight == 0 then
     return nil, "No peers are available"
   end
+  retryCount = retryCount or 0
   
+  local basePointer
+  local addressesTried
+  local tries = 0
   if hashValue then
-    hashValue = hashValue + (retryCount or 0) -- must update here because we're passing it to getPeer
-    pointer = 1 + (hashValue % self.wheelSize)
+    basePointer = hashValue
+
   else
-    -- no hash, so get the next one, round-robin like
-    pointer = (self.pointer or 0) + 1
-    if pointer > self.wheelSize then pointer = 1 end
-    self.pointer = pointer
+    basePointer = self.pointer  -- 0 indexed
   end
-  
-  local slot = self.wheel[pointer]
-  
-  return slot.address.host:getPeer(hashValue, cacheOnly, slot)
+
+  while true do
+    local pointer = (basePointer + tries + retryCount) % self.wheelSize + 1
+    local slot = self.wheel[pointer]
+
+    local ip, port, addr = slot.address.host:getPeer(slot, cacheOnly)
+    if ip then
+      -- success
+      if addr.up then
+        if not hashValue then
+          self.pointer = self.pointer + tries + 1
+          while self.pointer >= self.wheelSize do
+            self.pointer = self.pointer - self.wheelSize
+          end
+        end
+        return ip, port, addr
+      end
+
+      -- address is down
+      addressesTried = addressesTried or { n = 0 }
+      if not addressesTried[addr] then
+        addressesTried[addr] = true
+        addressesTried.n = addressesTried.n + 1
+        if addressesTried.n >= self.addressCount then
+          -- we tried all addresses, so apparently everything we've got is
+          -- unhealthy.
+          self.pointer = self.pointer + 1 -- everything is down, but let's rotate anyway
+          if self.pointer >= self.wheelSize then
+            self.pointer = 0
+          end
+          -- it's unhealthy, but we return it anyway as we've got nothing better
+          return ip, port, addr
+        end
+      end
+      tries = tries + 1
+
+    elseif port == SLOT_REASSIGNED then
+      -- our slot was reassigned, so we need to retry with the same slot
+      -- and we're not updating `tries`.
+
+    else
+      -- some error occurred
+      return ip, port
+    end
+  end
+
+  -- this is out of reach
 end
 
 -- Timer invoked to check for failed queries
@@ -925,6 +994,8 @@ _M.new = function(opts)
     weight = 0,    -- total weight of all hosts
     wheel = nil,   -- wheel with entries (fully randomized)
     slots = nil,   -- list of slots in no particular order
+    addressCount = 0, -- number of addresses held currently in this balancer
+    pointer = 0,   -- pointer for the round robin scheme (0 indexed!)
     wheelSize = opts.wheelSize or 1000, -- number of entries in the wheel
     dns = opts.dns,  -- the configured dns client to use for resolving
     unassignedSlots = nil, -- list to hold unassigned slots (initially, and when all hosts fail)
@@ -997,6 +1068,7 @@ end
 --- Creates a MD5 hash value from a string.
 -- The string will be hashed using MD5, and then shortened to 4 bytes.
 -- The returned hash value can be used as input for the `getpeer` function.
+-- @function hash_md5
 -- @param str (string) value to create the hash from
 -- @return 32-bit numeric hash
 _M.hash_md5 = function(str)
@@ -1012,6 +1084,7 @@ end
 -- The string will be hashed using CRC32. The returned hash value can be
 -- used as input for the `getpeer` function. This is simply a shortcut to
 -- `ngx.crc32_short`.
+-- @function hash_crc32
 -- @param str (string) value to create the hash from
 -- @return 32-bit numeric hash
 _M.hash_crc32 = ngx.crc32_short

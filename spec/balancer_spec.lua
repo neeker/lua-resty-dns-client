@@ -555,7 +555,7 @@ describe("Loadbalancer", function()
   end)
 
   describe("getting targets", function()
-    it("gets an IP address and port number round-robin", function()
+    it("gets an IP address and port number; round-robin", function()
       dnsA({ 
         { name = "mashape.com", address = "1.2.3.4" },
       })
@@ -573,7 +573,8 @@ describe("Loadbalancer", function()
       -- run down the wheel twice
       local res = {}
       for _ = 1, 15*2 do
-        local addr, port, host = b:getPeer()
+        local addr, port, addrObj = b:getPeer()
+        local host = addrObj.host.hostname
         res[addr..":"..port] = (res[addr..":"..port] or 0) + 1
         res[host..":"..port] = (res[host..":"..port] or 0) + 1
       end
@@ -581,6 +582,9 @@ describe("Loadbalancer", function()
       assert.equal(20, res["mashape.com:123"])
       assert.equal(10, res["5.6.7.8:321"])
       assert.equal(10, res["getkong.org:321"])
+    end)
+    pending("gets an IP address and port number; round-robin with down-peers", function()
+      
     end)
     it("gets an IP address and port number; consistent hashing", function()
       dnsA({ 
@@ -600,7 +604,8 @@ describe("Loadbalancer", function()
       -- run down the wheel, hitting all slots once
       local res = {}
       for n = 1, 15 do
-        local addr, port, host = b:getPeer(n)
+        local addr, port, addrObj = b:getPeer(n)
+        local host = addrObj.host.hostname
         res[addr..":"..port] = (res[addr..":"..port] or 0) + 1
         res[host..":"..port] = (res[host..":"..port] or 0) + 1
       end
@@ -610,13 +615,14 @@ describe("Loadbalancer", function()
       res = {}
       local hash = 6  -- just pick one
       for _ = 1, 15 do
-        local addr, port, host = b:getPeer(hash)
+        local addr, port, addrObj = b:getPeer(hash)
+        local host = addrObj.host.hostname
         res[addr..":"..port] = (res[addr..":"..port] or 0) + 1
         res[host..":"..port] = (res[host..":"..port] or 0) + 1
       end
-      assert(15 == res["1.2.3.4:123"] or nil == res["1.2.3.4:123"], "mismatch")
+      assert(15 == res["1.2.3.4:123"]     or nil == res["1.2.3.4:123"], "mismatch")
       assert(15 == res["mashape.com:123"] or nil == res["mashape.com:123"], "mismatch")
-      assert(15 == res["5.6.7.8:321"] or nil == res["5.6.7.8:321"], "mismatch")
+      assert(15 == res["5.6.7.8:321"]     or nil == res["5.6.7.8:321"], "mismatch")
       assert(15 == res["getkong.org:321"] or nil == res["getkong.org:321"], "mismatch")
     end)
     it("gets an IP address and port number; consistent hashing wraps (modulo)", function()
@@ -675,6 +681,9 @@ describe("Loadbalancer", function()
       for _,_ in pairs(res) do count = count + 1 end
       assert.equal(10, count) -- 10 unique entries
     end)
+    pending("gets an IP address and port number; consistent hashing with down-peers", function()
+      
+    end)
     it("does not hit the resolver when 'cache_only' is set", function()
       local record = dnsA({ 
         { name = "mashape.com", address = "1.2.3.4" },
@@ -692,7 +701,8 @@ describe("Loadbalancer", function()
       spy.on(client, "resolve")
       local hash = nil
       local cache_only = true
-      local ip, port, host = b:getPeer(hash, nil, cache_only)
+      local ip, port, addr = b:getPeer(hash, nil, cache_only)
+      local host = addr.host.hostname
       assert.spy(client.resolve).Not.called_with("mashape.com",nil, nil)
       assert.equal("1.2.3.4", ip)  -- initial un-updated ip address
       assert.equal(80, port)
@@ -713,6 +723,9 @@ describe("Loadbalancer", function()
       assert.is_nil(ip)
       assert.equals("No peers are available", port)
       assert.is_nil(host)
+    end)
+    pending("returns a 'down' target when they are all down", function()
+        
     end)
   end)
 
